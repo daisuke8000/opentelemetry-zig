@@ -338,3 +338,61 @@ test "metric reader correctness exporting cumulative temporality" {
     // and that timestamp is preserved in a long-running series
     try std.testing.expectEqual(result[0].data.int[0].timestamps.?.time_ns, result2[0].data.int[0].timestamps.?.start_time_ns);
 }
+
+test "metric reader cumulative histogram across collection" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const mp = try MeterProvider.init(allocator, io);
+    defer mp.shutdown();
+
+    var inMem = try InMemoryExporter.init(allocator, io);
+    defer inMem.deinit();
+
+    const metric_exporter = try MetricExporter.new(allocator, io, &inMem.exporter);
+
+    var reader = try MetricReader.init(allocator, io, metric_exporter);
+    defer reader.shutdown();
+    try mp.addReader(reader);
+
+    // Generate data
+    const meter = try mp.getMeter(.{
+        .name = "test",
+    });
+    const histogram = try meter.createHistogram(f64, .{ .name = "test-histogram" });
+    try histogram.record(0.25, .{});
+
+    // first collection: count=1, sum=0.25
+    try reader.collect();
+    const result = try inMem.fetch(allocator);
+    defer {
+        for (result) |m| {
+            var data = m;
+            data.deinit(std.testing.allocator);
+        }
+        std.testing.allocator.free(result);
+    }
+
+    // Assert the first collection result
+    const first = result[0].data.histogram[0].value;
+    try std.testing.expectEqual(1, first.count);
+    try std.testing.expectEqual(0.25, first.sum.?);
+
+    try histogram.record(0.5, .{});
+
+    // second collection: count=2, sum=0.75
+    try reader.collect();
+    const result2 = try inMem.fetch(allocator);
+    defer {
+        for (result2) |m| {
+            var data = m;
+            data.deinit(std.testing.allocator);
+        }
+        std.testing.allocator.free(result2);
+    }
+
+    // Assert the second collection result
+    const second = result2[0].data.histogram[0].value;
+    try std.testing.expectEqual(2, second.count);
+    try std.testing.expectEqual(0.75, second.sum.?);
+}

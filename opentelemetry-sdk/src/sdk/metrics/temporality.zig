@@ -10,6 +10,7 @@ const Attribute = @import("../../attributes.zig").Attribute;
 const Attributes = @import("../../attributes.zig").Attributes;
 const DataPoint = @import("../../api/metrics/measurement.zig").DataPoint;
 const Measurements = @import("../../api/metrics/measurement.zig").Measurements;
+const HistogramDataPoint = @import("../../api/metrics/measurement.zig").HistogramDataPoint;
 const view = @import("view.zig");
 
 const TemporalAggregator = @This();
@@ -61,6 +62,7 @@ pub const HashContext = struct {
 memory: std.mem.Allocator,
 ints: std.HashMap(ScopedDataPoint, DataPoint(i64), HashContext, std.hash_map.default_max_load_percentage),
 doubles: std.HashMap(ScopedDataPoint, DataPoint(f64), HashContext, std.hash_map.default_max_load_percentage),
+histograms: std.HashMap(ScopedDataPoint, DataPoint(HistogramDataPoint), HashContext, std.hash_map.default_max_load_percentage),
 
 pub fn init(allocator: std.mem.Allocator) !*TemporalAggregator {
     const this = try allocator.create(TemporalAggregator);
@@ -68,6 +70,7 @@ pub fn init(allocator: std.mem.Allocator) !*TemporalAggregator {
         .memory = allocator,
         .ints = std.HashMap(ScopedDataPoint, DataPoint(i64), HashContext, std.hash_map.default_max_load_percentage).init(allocator),
         .doubles = std.HashMap(ScopedDataPoint, DataPoint(f64), HashContext, std.hash_map.default_max_load_percentage).init(allocator),
+        .histograms = std.HashMap(ScopedDataPoint, DataPoint(HistogramDataPoint), HashContext, std.hash_map.default_max_load_percentage).init(allocator),
     };
     return this;
 }
@@ -81,8 +84,16 @@ pub fn deinit(self: *TemporalAggregator) void {
     while (double_keys.next()) |key| {
         if (key.datapoint_attributes) |attrs| self.memory.free(attrs);
     }
+    var histogram_entries = self.histograms.iterator();
+    while (histogram_entries.next()) |entry| {
+        if (entry.key_ptr.datapoint_attributes) |attrs| {
+            self.memory.free(attrs);
+        }
+        entry.value_ptr.deinit(self.memory);
+    }
     self.ints.deinit();
     self.doubles.deinit();
+    self.histograms.deinit();
     self.memory.destroy(self);
 }
 
@@ -128,6 +139,100 @@ fn processCumulativeDataPoints(
             gop.value_ptr.timestamps = .{ .start_time_ns = dp_start_time, .time_ns = dp_time };
         }
         dp.value = gop.value_ptr.value;
+        dp.timestamps = gop.value_ptr.timestamps;
+    }
+}
+
+fn processCumulativeHistogramDataPoints(
+    map: *std.HashMap(ScopedDataPoint, DataPoint(HistogramDataPoint), HashContext, std.hash_map.default_max_load_percentage),
+    measurements: *Measurements,
+    datapoints: [*]DataPoint(HistogramDataPoint),
+    array_len: usize,
+) !void {
+    for (0..array_len) |idx| {
+        const dp = &datapoints[idx];
+        const identity = ScopedDataPoint{
+            .scope = measurements.scope,
+            .instrument_name = measurements.instrumentOptions.name,
+            .instrument_kind = measurements.instrumentKind,
+            .datapoint_attributes = dp.attributes,
+        };
+
+        const incoming_ts = dp.timestamps orelse return TemporalAggregationError.MissingTimestampTimeUnixNano;
+        const dp_time = incoming_ts.time_ns;
+        const dp_start_time = incoming_ts.start_time_ns orelse dp_time;
+
+        const gop = try map.getOrPut(identity);
+        if (gop.found_existing) {
+            const existing_ts = gop.value_ptr.timestamps orelse return TemporalAggregationError.MissingTimestampStartTimeUnixNano;
+
+            const stored = &gop.value_ptr.value;
+            stored.count = try std.math.add(u64, stored.count, dp.value.count);
+
+            stored.sum = if (stored.sum) |previous_sum|
+                if (dp.value.sum) |current_sum|
+                    previous_sum + current_sum
+                else
+                    null
+            else
+                null;
+
+            stored.min = if (stored.min) |previous_min|
+                if (dp.value.min) |current_min|
+                    @min(previous_min, current_min)
+                else
+                    null
+            else
+                null;
+
+            stored.max = if (stored.max) |previous_max|
+                if (dp.value.max) |current_max|
+                    @max(previous_max, current_max)
+                else
+                    null
+            else
+                null;
+
+            for (stored.bucket_counts, dp.value.bucket_counts) |*stored_count, current_count| {
+                stored_count.* = try std.math.add(u64, stored_count.*, current_count);
+            }
+
+            gop.value_ptr.timestamps = .{
+                .start_time_ns = existing_ts.start_time_ns,
+                .time_ns = dp_time,
+            };
+        } else {
+            errdefer _ = map.remove(identity);
+
+            const attrs = try Attributes.with(dp.attributes).dupe(map.allocator);
+            errdefer {
+                if (attrs) |a| map.allocator.free(a);
+            }
+
+            const bucket_counts = try map.allocator.dupe(u64, dp.value.bucket_counts);
+
+            var stored_value = dp.value;
+            stored_value.bucket_counts = bucket_counts;
+
+            gop.key_ptr.datapoint_attributes = attrs;
+            gop.value_ptr.* = .{
+                .value = stored_value,
+                .timestamps = .{
+                    .start_time_ns = dp_start_time,
+                    .time_ns = dp_time,
+                },
+            };
+        }
+
+        const output_bucket_counts = try map.allocator.dupe(
+            u64,
+            gop.value_ptr.value.bucket_counts,
+        );
+
+        map.allocator.free(dp.value.bucket_counts);
+
+        dp.value = gop.value_ptr.value;
+        dp.value.bucket_counts = output_bucket_counts;
         dp.timestamps = gop.value_ptr.timestamps;
     }
 }
@@ -186,7 +291,8 @@ pub fn process(self: *TemporalAggregator, measurements: *Measurements, temporali
         .Cumulative => {
             switch (measurements.data) {
                 // TODO update here when the histogram attributes are implemented as an aggregation from raw data points rather than pre-computing them.
-                .histogram, .exponential_histogram => return,
+                .histogram => |datapoints| try processCumulativeHistogramDataPoints(&self.histograms, measurements, datapoints.ptr, datapoints.len),
+                .exponential_histogram => return,
                 .int => |datapoints| try processCumulativeDataPoints(i64, &self.ints, measurements, datapoints.ptr, datapoints.len),
                 .double => |datapoints| try processCumulativeDataPoints(f64, &self.doubles, measurements, datapoints.ptr, datapoints.len),
             }
