@@ -646,16 +646,6 @@ test "e2e periodic exporting metric reader" {
 
     const metric_exporter = try MetricExporter.new(allocator, io, &inMem.exporter);
 
-    var per = try PeriodicExportingReader.init(
-        allocator,
-        io,
-        mp,
-        metric_exporter,
-        waiting_ms,
-        null,
-    );
-    defer per.shutdown();
-
     var meter = try mp.getMeter(.{ .name = "test-reader", .attributes = try Attributes.from(
         allocator,
         .{ "wonderful", true },
@@ -675,8 +665,18 @@ test "e2e periodic exporting metric reader" {
     try histogram.record(1.4, .{});
     try histogram.record(10.4, .{});
 
-    // Need to wait for the PeriodicExportingReader to collect and export the metrics.
-    // Wait for more than 1 collection cycle to ensure that no duplication of data points occurs.
+    // Start collection after recording so the first batch includes all observations.
+    var per = try PeriodicExportingReader.init(
+        allocator,
+        io,
+        mp,
+        metric_exporter,
+        waiting_ms,
+        null,
+    );
+    defer per.shutdown();
+
+    // Allow repeated collections; cumulative values must not grow without new records.
     clock.sleep(waiting_ms * 4 * std.time.ns_per_ms);
 
     const data = try inMem.fetch(allocator);
@@ -687,14 +687,27 @@ test "e2e periodic exporting metric reader" {
         allocator.free(data);
     }
 
-    // There are 2 measurements: a counter and a histogram.
-    try std.testing.expectEqual(2, data.len);
-    // Meter attributes are added.
-    try std.testing.expectEqual("test-reader", data[0].scope.name);
-    try std.testing.expectEqual(1, data[0].scope.attributes.?.len);
-    try std.testing.expectEqual("wonderful", data[0].scope.attributes.?[0].key);
-    // Counter has 2 data points.
-    try std.testing.expectEqual(2, data[0].data.int.len);
+    var seen_counter = false;
+    var seen_histogram = false;
+    for (data) |m| {
+        try std.testing.expectEqual("test-reader", m.scope.name);
+        try std.testing.expectEqual(1, m.scope.attributes.?.len);
+        try std.testing.expectEqual("wonderful", m.scope.attributes.?[0].key);
+
+        if (std.mem.eql(u8, m.instrumentOptions.name, "requests")) {
+            seen_counter = true;
+            try std.testing.expectEqual(2, m.data.int.len);
+        } else if (std.mem.eql(u8, m.instrumentOptions.name, "latency")) {
+            seen_histogram = true;
+            try std.testing.expectEqual(1, m.data.histogram.len);
+            const value = m.data.histogram[0].value;
+            try std.testing.expectEqual(2, value.count);
+            try std.testing.expectApproxEqAbs(11.8, value.sum.?, 1e-12);
+        } else {
+            return error.UnexpectedMetric;
+        }
+    }
+    try std.testing.expect(seen_counter and seen_histogram);
 }
 
 // Include testing for the exporters
