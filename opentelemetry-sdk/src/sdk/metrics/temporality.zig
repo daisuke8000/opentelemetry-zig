@@ -279,6 +279,87 @@ pub fn process(self: *TemporalAggregator, measurements: *Measurements, temporali
     }
 }
 
+test "cumulative histogram reuses the output bucket buffer" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+    const ta = try TemporalAggregator.init(allocator);
+    defer ta.deinit();
+
+    for ([_]f64{ 0.25, 0.5, 0.75 }, 0..) |value, i| {
+        var dp = DataPoint(HistogramDataPoint){
+            .value = .{
+                .count = 1,
+                .sum = value,
+                .min = value,
+                .max = value,
+                .explicit_bounds = &.{ 0.3, 0.6 },
+                .bucket_counts = try allocator.dupe(u64, &.{ 0, 0, 0 }),
+            },
+            .timestamps = .{ .time_ns = (i + 1) * 100 },
+        };
+        defer dp.deinit(allocator);
+        dp.value.bucket_counts[i] = 1;
+        var measurements = Measurements{
+            .scope = .{ .name = "test" },
+            .instrumentKind = .Histogram,
+            .instrumentOptions = .{ .name = "test-histogram" },
+            .data = .{ .histogram = (&dp)[0..1] },
+        };
+
+        // Updating an existing series needs no new output allocation.
+        if (i == 1) failing.fail_index = failing.alloc_index;
+        try ta.process(&measurements, view.TemporalityCumulative);
+        failing.fail_index = std.math.maxInt(usize);
+
+        if (i == 2) {
+            try std.testing.expectEqual(3, dp.value.count);
+            try std.testing.expectEqual(1.5, dp.value.sum.?);
+            try std.testing.expectEqualSlices(u64, &.{ 1, 1, 1 }, dp.value.bucket_counts);
+        }
+    }
+}
+
+test "cumulative histogram leaves state unchanged on count overflow" {
+    const allocator = std.testing.allocator;
+    const ta = try TemporalAggregator.init(allocator);
+    defer ta.deinit();
+    var first = DataPoint(HistogramDataPoint){
+        .value = .{
+            .count = std.math.maxInt(u64),
+            .sum = 0,
+            .min = 0,
+            .max = 0,
+            .explicit_bounds = &.{},
+            .bucket_counts = try allocator.dupe(u64, &.{std.math.maxInt(u64)}),
+        },
+        .timestamps = .{ .time_ns = 100 },
+    };
+    defer first.deinit(allocator);
+    var measurements = Measurements{
+        .scope = .{ .name = "test" },
+        .instrumentKind = .Histogram,
+        .instrumentOptions = .{ .name = "test-histogram" },
+        .data = .{ .histogram = (&first)[0..1] },
+    };
+    try ta.process(&measurements, view.TemporalityCumulative);
+
+    var second = first;
+    second.value = .{
+        .count = 1,
+        .sum = 0.5,
+        .min = 0.5,
+        .max = 0.5,
+        .explicit_bounds = &.{},
+        .bucket_counts = try allocator.dupe(u64, &.{1}),
+    };
+    second.timestamps = .{ .time_ns = 200 };
+    defer second.deinit(allocator);
+    measurements.data = .{ .histogram = (&second)[0..1] };
+    try std.testing.expectError(error.Overflow, ta.process(&measurements, view.TemporalityCumulative));
+    var entries = ta.histograms.valueIterator();
+    try std.testing.expectEqualDeep(first, entries.next().?.*);
+}
+
 test "temporal aggregator process cumulative without timestamps returns error" {
     const allocator = std.testing.allocator;
     const ta = try TemporalAggregator.init(allocator);

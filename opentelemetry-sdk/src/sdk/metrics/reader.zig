@@ -441,76 +441,63 @@ test "metric reader correctness exporting cumulative temporality" {
 test "metric reader cumulative histogram across collection" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    const bounds = @import("../../api/metrics/spec.zig").default_histogram_explicit_bucket_boundaries;
 
-    const mp = try MeterProvider.init(allocator, io);
-    defer mp.shutdown();
+    inline for (.{ f64, i64 }) |T| {
+        const mp = try MeterProvider.init(allocator, io);
+        defer mp.shutdown();
+        var inMem = try InMemoryExporter.init(allocator, io);
+        defer inMem.deinit();
+        const metric_exporter = try MetricExporter.new(allocator, io, &inMem.exporter);
+        const reader = try MetricReader.init(allocator, io, metric_exporter);
+        defer reader.shutdown();
+        try mp.addReader(reader);
+        const meter = try mp.getMeter(.{ .name = "test" });
+        const histogram = try meter.createHistogram(T, .{ .name = "test-histogram" });
+        const first: T = if (T == f64) 0.25 else 1;
+        const second: T = if (T == f64) 0.5 else 6;
+        var start_time: ?u64 = null;
 
-    var inMem = try InMemoryExporter.init(allocator, io);
-    defer inMem.deinit();
+        for (0..3) |cycle| {
+            if (cycle == 0) try histogram.record(first, .{});
+            if (cycle == 1) try histogram.record(second, .{});
+            const before: u64 = @intCast(clock.nanoTimestamp());
+            try reader.collect();
+            const after: u64 = @intCast(clock.nanoTimestamp());
+            const result = try inMem.fetch(allocator);
+            defer {
+                for (result) |*m| m.deinit(allocator);
+                allocator.free(result);
+            }
+            try std.testing.expectEqual(1, result.len);
+            try std.testing.expectEqual(1, result[0].data.histogram.len);
+            const dp = result[0].data.histogram[0];
+            const value = dp.value;
+            try std.testing.expectEqual(@as(u64, if (cycle == 0) 1 else 2), value.count);
+            if (T == f64) {
+                try std.testing.expectEqual(@as(f64, if (cycle == 0) 0.25 else 0.75), value.sum.?);
+            } else {
+                // Signed integer histogram aggregation omits sum.
+                try std.testing.expectEqual(null, value.sum);
+            }
+            const expected_min: f64 = if (T == f64) first else @floatFromInt(first);
+            const expected_max: f64 = if (cycle == 0) expected_min else if (T == f64) second else @floatFromInt(second);
+            try std.testing.expectEqual(expected_min, value.min.?);
+            try std.testing.expectEqual(expected_max, value.max.?);
+            var counts = [_]u64{0} ** (bounds.len + 1);
+            counts[1] = 1;
+            if (cycle > 0) counts[if (T == f64) 1 else 2] += 1;
+            try std.testing.expectEqualSlices(u64, &counts, value.bucket_counts);
 
-    const metric_exporter = try MetricExporter.new(allocator, io, &inMem.exporter);
-
-    var reader = try MetricReader.init(allocator, io, metric_exporter);
-    defer reader.shutdown();
-    try mp.addReader(reader);
-
-    // Generate data
-    const meter = try mp.getMeter(.{
-        .name = "test",
-    });
-    const histogram = try meter.createHistogram(f64, .{ .name = "test-histogram" });
-    try histogram.record(0.25, .{});
-
-    // first collection: count=1, sum=0.25
-    try reader.collect();
-    const result = try inMem.fetch(allocator);
-    defer {
-        for (result) |m| {
-            var data = m;
-            data.deinit(std.testing.allocator);
+            const timestamps = dp.timestamps.?;
+            if (cycle == 0) {
+                start_time = timestamps.start_time_ns;
+                try std.testing.expectEqual(timestamps.time_ns, start_time);
+            }
+            try std.testing.expectEqual(start_time, timestamps.start_time_ns);
+            try std.testing.expect(timestamps.time_ns >= before and timestamps.time_ns <= after);
         }
-        std.testing.allocator.free(result);
     }
-
-    // Assert the first collection result
-    const first = result[0].data.histogram[0].value;
-    try std.testing.expectEqual(1, first.count);
-    try std.testing.expectEqual(0.25, first.sum.?);
-
-    try histogram.record(0.5, .{});
-
-    // second collection: count=2, sum=0.75
-    try reader.collect();
-    const result2 = try inMem.fetch(allocator);
-    defer {
-        for (result2) |m| {
-            var data = m;
-            data.deinit(std.testing.allocator);
-        }
-        std.testing.allocator.free(result2);
-    }
-
-    // Assert the second collection result
-    const second = result2[0].data.histogram[0].value;
-    try std.testing.expectEqual(2, second.count);
-    try std.testing.expectEqual(0.75, second.sum.?);
-
-    try reader.collect();
-    const result3 = try inMem.fetch(allocator);
-    defer {
-        for (result3) |m| {
-            var data = m;
-            data.deinit(std.testing.allocator);
-        }
-        std.testing.allocator.free(result3);
-    }
-
-    try std.testing.expectEqual(@as(usize, 1), result3.len);
-    try std.testing.expectEqual(@as(usize, 1), result3[0].data.histogram.len);
-
-    const third = result3[0].data.histogram[0].value;
-    try std.testing.expectEqual(2, third.count);
-    try std.testing.expectEqual(0.75, third.sum.?);
 }
 
 test "metric reader frees pending histograms on collection failure" {
@@ -654,5 +641,49 @@ test "metric reader cumulative histogram retains inactive series" {
             }
         }
         try std.testing.expect(seen_get and seen_post);
+    }
+}
+
+test "metric reader cumulative histogram separates instrument options" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const mp = try MeterProvider.init(allocator, io);
+    defer mp.shutdown();
+    const inMem = try InMemoryExporter.init(allocator, io);
+    defer inMem.deinit();
+    const metric_exporter = try MetricExporter.new(allocator, io, &inMem.exporter);
+    const reader = try MetricReader.init(allocator, io, metric_exporter);
+    defer reader.shutdown();
+    try mp.addReader(reader);
+    const meter = try mp.getMeter(.{ .name = "test" });
+    const ms = try meter.createHistogram(f64, .{ .name = "duration", .unit = "ms" });
+    const seconds = try meter.createHistogram(f64, .{ .name = "duration", .unit = "s" });
+    const other = try meter.createHistogram(f64, .{ .name = "duration", .unit = "ms", .description = "other" });
+    try ms.record(0.25, .{});
+    try seconds.record(0.5, .{});
+    try other.record(0.75, .{});
+
+    for (0..3) |cycle| {
+        if (cycle == 1) try ms.record(0.25, .{});
+        try reader.collect();
+        const result = try inMem.fetch(allocator);
+        defer {
+            for (result) |*m| m.deinit(allocator);
+            allocator.free(result);
+        }
+        try std.testing.expectEqual(3, result.len);
+        var seen = [_]bool{ false, false, false };
+        for (result) |m| {
+            const index: usize = if (m.instrumentOptions.description != null) 2 else if (std.mem.eql(u8, m.instrumentOptions.unit.?, "s")) 1 else 0;
+            try std.testing.expect(!seen[index]);
+            seen[index] = true;
+            try std.testing.expectEqualStrings("duration", m.instrumentOptions.name);
+            try std.testing.expectEqualStrings(if (index == 1) "s" else "ms", m.instrumentOptions.unit.?);
+            try std.testing.expectEqualStrings(if (index == 2) "other" else "", m.instrumentOptions.description orelse "");
+            try std.testing.expectEqual(1, m.data.histogram.len);
+            try std.testing.expectEqual(@as(u64, if (index == 0 and cycle > 0) 2 else 1), m.data.histogram[0].value.count);
+            const sums = [_]f64{ if (cycle == 0) 0.25 else 0.5, 0.5, 0.75 };
+            try std.testing.expectEqual(sums[index], m.data.histogram[0].value.sum.?);
+        }
     }
 }
