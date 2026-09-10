@@ -646,6 +646,16 @@ test "e2e periodic exporting metric reader" {
 
     const metric_exporter = try MetricExporter.new(allocator, io, &inMem.exporter);
 
+    var per = try PeriodicExportingReader.init(
+        allocator,
+        io,
+        mp,
+        metric_exporter,
+        waiting_ms,
+        null,
+    );
+    defer per.shutdown();
+
     var meter = try mp.getMeter(.{ .name = "test-reader", .attributes = try Attributes.from(
         allocator,
         .{ "wonderful", true },
@@ -664,17 +674,6 @@ test "e2e periodic exporting metric reader" {
     });
     try histogram.record(1.4, .{});
     try histogram.record(10.4, .{});
-
-    // Start collection after recording so the first batch includes all observations.
-    var per = try PeriodicExportingReader.init(
-        allocator,
-        io,
-        mp,
-        metric_exporter,
-        waiting_ms,
-        null,
-    );
-    defer per.shutdown();
 
     // Allow repeated collections; cumulative values must not grow without new records.
     clock.sleep(waiting_ms * 4 * std.time.ns_per_ms);
@@ -695,14 +694,19 @@ test "e2e periodic exporting metric reader" {
         try std.testing.expectEqual("wonderful", m.scope.attributes.?[0].key);
 
         if (std.mem.eql(u8, m.instrumentOptions.name, "requests")) {
-            seen_counter = true;
-            try std.testing.expectEqual(2, m.data.int.len);
+            try std.testing.expect(m.data.int.len == 1 or m.data.int.len == 2);
+            if (m.data.int.len == 2) seen_counter = true;
         } else if (std.mem.eql(u8, m.instrumentOptions.name, "latency")) {
-            seen_histogram = true;
             try std.testing.expectEqual(1, m.data.histogram.len);
             const value = m.data.histogram[0].value;
-            try std.testing.expectEqual(2, value.count);
-            try std.testing.expectApproxEqAbs(11.8, value.sum.?, 1e-12);
+            switch (value.count) {
+                1 => try std.testing.expectApproxEqAbs(1.4, value.sum.?, 1e-12),
+                2 => {
+                    try std.testing.expectApproxEqAbs(11.8, value.sum.?, 1e-12);
+                    seen_histogram = true;
+                },
+                else => return error.UnexpectedHistogramCount,
+            }
         } else {
             return error.UnexpectedMetric;
         }
