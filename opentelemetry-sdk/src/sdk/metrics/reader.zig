@@ -687,3 +687,61 @@ test "metric reader cumulative histogram separates instrument options" {
         }
     }
 }
+
+fn exponentialAggregation(_: Kind) view.Aggregation {
+    return .{ .ExponentialBucketHistogram = .{} };
+}
+
+test "metric reader cumulative exponential histogram across collection" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const mp = try MeterProvider.init(allocator, io);
+    defer mp.shutdown();
+
+    var inMem = try InMemoryExporter.init(allocator, io);
+    defer inMem.deinit();
+
+    const metric_exporter = try MetricExporter.new(allocator, io, &inMem.exporter);
+    metric_exporter.temporality = view.TemporalityCumulative;
+    metric_exporter.aggregation = exponentialAggregation;
+    const reader = try MetricReader.init(allocator, io, metric_exporter);
+    defer reader.shutdown();
+
+    const histogram_name = "test-exponential-histogram";
+    const meter = try mp.getMeter(.{ .name = "test" });
+    try mp.addReader(reader);
+    const exponential_histogram = try meter.createHistogram(f64, .{ .name = histogram_name });
+    const first: f64 = 1.5;
+    const second: f64 = 1.5;
+
+    try exponential_histogram.record(first, .{});
+    try reader.collect();
+
+    const result = try inMem.fetch(allocator);
+    defer {
+        for (result) |*m| m.deinit(allocator);
+        allocator.free(result);
+    }
+
+    try std.testing.expectEqual(1, result.len);
+    const dp = result[0].data.exponential_histogram;
+    try std.testing.expectEqual(1, dp.len);
+    try std.testing.expectEqual(1, dp[0].value.count);
+    try std.testing.expectEqual(1.5, dp[0].value.sum.?);
+
+    try exponential_histogram.record(second, .{});
+    try reader.collect();
+
+    const result2 = try inMem.fetch(allocator);
+    defer {
+        for (result2) |*m| m.deinit(allocator);
+        allocator.free(result2);
+    }
+
+    try std.testing.expectEqual(1, result2.len);
+    const dp2 = result2[0].data.exponential_histogram;
+    try std.testing.expectEqual(1, dp2.len);
+    try std.testing.expectEqual(2, dp2[0].value.count);
+    try std.testing.expectEqual(3, dp2[0].value.sum.?);
+}
