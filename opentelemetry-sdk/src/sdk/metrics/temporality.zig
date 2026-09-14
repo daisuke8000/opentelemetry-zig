@@ -173,186 +173,92 @@ fn processCumulativeDataPoints(
                     const new_zero_count = try std.math.add(u64, stored.zero_count, dp.value.zero_count);
 
                     if (stored.scale > dp.value.scale) {
-                        const new_positive_offset = std.math.shr(i32, stored.positive_offset, stored.scale - dp.value.scale);
-                        const new_positive_bucket_len = if (stored.positive_bucket_counts.len > 0) blk: {
-                            const last_stored_bucket_number = stored.positive_offset + @as(i32, @intCast(stored.positive_bucket_counts.len - 1));
-                            const new_last_bucket_number = std.math.shr(i32, last_stored_bucket_number, stored.scale - dp.value.scale);
-                            break :blk (new_last_bucket_number - new_positive_offset + 1);
-                        } else 0;
-
-                        const new_positive_bucket_counts = try map.allocator.alloc(u64, @as(usize, @intCast(new_positive_bucket_len)));
+                        const new_positive_buckets = try bucketScaleConverter(
+                            map.allocator,
+                            stored.positive_offset,
+                            stored.positive_bucket_counts,
+                            stored.scale - dp.value.scale,
+                        );
                         errdefer {
-                            map.allocator.free(new_positive_bucket_counts);
-                        }
-                        @memset(new_positive_bucket_counts, 0);
-
-                        for (stored.positive_bucket_counts, 0..) |count, i| {
-                            const stored_bucket_number = stored.positive_offset + @as(i32, @intCast(i));
-                            const new_bucket_number = std.math.shr(i32, stored_bucket_number, stored.scale - dp.value.scale);
-                            const new_index = @as(usize, @intCast(new_bucket_number - new_positive_offset));
-                            new_positive_bucket_counts[new_index] = try std.math.add(u64, new_positive_bucket_counts[new_index], count);
+                            map.allocator.free(new_positive_buckets.bucket_counts);
                         }
 
-                        const new_negative_offset = std.math.shr(i32, stored.negative_offset, stored.scale - dp.value.scale);
-                        const new_negative_bucket_len = if (stored.negative_bucket_counts.len > 0) blk: {
-                            const last_stored_bucket_number = stored.negative_offset + @as(i32, @intCast(stored.negative_bucket_counts.len - 1));
-                            const new_last_bucket_number = std.math.shr(i32, last_stored_bucket_number, stored.scale - dp.value.scale);
-                            break :blk (new_last_bucket_number - new_negative_offset + 1);
-                        } else 0;
-
-                        const new_negative_bucket_counts = try map.allocator.alloc(u64, @as(usize, @intCast(new_negative_bucket_len)));
+                        const new_negative_buckets = try bucketScaleConverter(
+                            map.allocator,
+                            stored.negative_offset,
+                            stored.negative_bucket_counts,
+                            stored.scale - dp.value.scale,
+                        );
                         errdefer {
-                            map.allocator.free(new_negative_bucket_counts);
-                        }
-                        @memset(new_negative_bucket_counts, 0);
-
-                        for (stored.negative_bucket_counts, 0..) |count, i| {
-                            const stored_bucket_number = stored.negative_offset + @as(i32, @intCast(i));
-                            const new_bucket_number = std.math.shr(i32, stored_bucket_number, stored.scale - dp.value.scale);
-                            const new_index = @as(usize, @intCast(new_bucket_number - new_negative_offset));
-                            new_negative_bucket_counts[new_index] = try std.math.add(u64, new_negative_bucket_counts[new_index], count);
+                            map.allocator.free(new_negative_buckets.bucket_counts);
                         }
 
                         map.allocator.free(stored.positive_bucket_counts);
                         map.allocator.free(stored.negative_bucket_counts);
 
-                        stored.positive_bucket_counts = new_positive_bucket_counts;
-                        stored.negative_bucket_counts = new_negative_bucket_counts;
-                        stored.positive_offset = new_positive_offset;
-                        stored.negative_offset = new_negative_offset;
+                        stored.positive_bucket_counts = new_positive_buckets.bucket_counts;
+                        stored.negative_bucket_counts = new_negative_buckets.bucket_counts;
+                        stored.positive_offset = new_positive_buckets.offset;
+                        stored.negative_offset = new_negative_buckets.offset;
                         stored.scale = dp.value.scale;
                     } else if (dp.value.scale > stored.scale) {
-                        const new_positive_offset = std.math.shr(i32, dp.value.positive_offset, dp.value.scale - stored.scale);
-                        const new_positive_bucket_len = if (dp.value.positive_bucket_counts.len > 0) blk: {
-                            const last_dp_bucket_number = dp.value.positive_offset + @as(i32, @intCast(dp.value.positive_bucket_counts.len - 1));
-                            const new_last_bucket_number = std.math.shr(i32, last_dp_bucket_number, dp.value.scale - stored.scale);
-                            break :blk (new_last_bucket_number - new_positive_offset + 1);
-                        } else 0;
-
-                        const new_positive_bucket_counts = try map.allocator.alloc(u64, @as(usize, @intCast(new_positive_bucket_len)));
+                        const new_positive_buckets = try bucketScaleConverter(
+                            map.allocator,
+                            dp.value.positive_offset,
+                            dp.value.positive_bucket_counts,
+                            dp.value.scale - stored.scale,
+                        );
                         errdefer {
-                            map.allocator.free(new_positive_bucket_counts);
-                        }
-                        @memset(new_positive_bucket_counts, 0);
-
-                        for (dp.value.positive_bucket_counts, 0..) |count, i| {
-                            const dp_bucket_number = dp.value.positive_offset + @as(i32, @intCast(i));
-                            const new_bucket_number = std.math.shr(i32, dp_bucket_number, dp.value.scale - stored.scale);
-                            const new_index = @as(usize, @intCast(new_bucket_number - new_positive_offset));
-                            new_positive_bucket_counts[new_index] = try std.math.add(u64, new_positive_bucket_counts[new_index], count);
+                            map.allocator.free(new_positive_buckets.bucket_counts);
                         }
 
-                        const new_negative_offset = std.math.shr(i32, dp.value.negative_offset, dp.value.scale - stored.scale);
-                        const new_negative_bucket_len = if (dp.value.negative_bucket_counts.len > 0) blk: {
-                            const last_dp_bucket_number = dp.value.negative_offset + @as(i32, @intCast(dp.value.negative_bucket_counts.len - 1));
-                            const new_last_bucket_number = std.math.shr(i32, last_dp_bucket_number, dp.value.scale - stored.scale);
-                            break :blk (new_last_bucket_number - new_negative_offset + 1);
-                        } else 0;
-
-                        const new_negative_bucket_counts = try map.allocator.alloc(u64, @as(usize, @intCast(new_negative_bucket_len)));
+                        const new_negative_buckets = try bucketScaleConverter(
+                            map.allocator,
+                            dp.value.negative_offset,
+                            dp.value.negative_bucket_counts,
+                            dp.value.scale - stored.scale,
+                        );
                         errdefer {
-                            map.allocator.free(new_negative_bucket_counts);
-                        }
-                        @memset(new_negative_bucket_counts, 0);
-
-                        for (dp.value.negative_bucket_counts, 0..) |count, i| {
-                            const dp_bucket_number = dp.value.negative_offset + @as(i32, @intCast(i));
-                            const new_bucket_number = std.math.shr(i32, dp_bucket_number, dp.value.scale - stored.scale);
-                            const new_index = @as(usize, @intCast(new_bucket_number - new_negative_offset));
-                            new_negative_bucket_counts[new_index] = try std.math.add(u64, new_negative_bucket_counts[new_index], count);
+                            map.allocator.free(new_negative_buckets.bucket_counts);
                         }
 
                         map.allocator.free(dp.value.positive_bucket_counts);
                         map.allocator.free(dp.value.negative_bucket_counts);
 
-                        dp.value.positive_bucket_counts = new_positive_bucket_counts;
-                        dp.value.negative_bucket_counts = new_negative_bucket_counts;
-                        dp.value.positive_offset = new_positive_offset;
-                        dp.value.negative_offset = new_negative_offset;
+                        dp.value.positive_bucket_counts = new_positive_buckets.bucket_counts;
+                        dp.value.negative_bucket_counts = new_negative_buckets.bucket_counts;
+                        dp.value.positive_offset = new_positive_buckets.offset;
+                        dp.value.negative_offset = new_negative_buckets.offset;
                         dp.value.scale = stored.scale;
                     }
 
-                    const new_positive_offset = if (stored.positive_bucket_counts.len != 0 and dp.value.positive_bucket_counts.len != 0)
-                        @min(stored.positive_offset, dp.value.positive_offset)
-                    else if (stored.positive_bucket_counts.len != 0)
-                        stored.positive_offset
-                    else if (dp.value.positive_bucket_counts.len != 0)
-                        dp.value.positive_offset
-                    else
-                        0;
+                    const positive_buckets = try bucketAggregation(
+                        map.allocator,
+                        stored.positive_offset,
+                        stored.positive_bucket_counts,
+                        dp.value.positive_offset,
+                        dp.value.positive_bucket_counts,
+                    );
+                    errdefer map.allocator.free(positive_buckets.bucket_counts);
 
-                    const new_positive_bucket_len = if (stored.positive_bucket_counts.len != 0 and dp.value.positive_bucket_counts.len != 0) blk: {
-                        const stored_last_number = stored.positive_offset + @as(i32, @intCast(stored.positive_bucket_counts.len - 1));
-                        const dp_last_number = dp.value.positive_offset + @as(i32, @intCast(dp.value.positive_bucket_counts.len - 1));
-                        const max_number = @max(stored_last_number, dp_last_number);
-                        break :blk @as(usize, @intCast(max_number - new_positive_offset + 1));
-                    } else if (stored.positive_bucket_counts.len != 0)
-                        stored.positive_bucket_counts.len
-                    else if (dp.value.positive_bucket_counts.len != 0)
-                        dp.value.positive_bucket_counts.len
-                    else
-                        0;
-
-                    const new_negative_offset = if (stored.negative_bucket_counts.len != 0 and dp.value.negative_bucket_counts.len != 0)
-                        @min(stored.negative_offset, dp.value.negative_offset)
-                    else if (stored.negative_bucket_counts.len != 0)
-                        stored.negative_offset
-                    else if (dp.value.negative_bucket_counts.len != 0)
-                        dp.value.negative_offset
-                    else
-                        0;
-
-                    const new_negative_bucket_len = if (stored.negative_bucket_counts.len != 0 and dp.value.negative_bucket_counts.len != 0) blk: {
-                        const stored_last_number = stored.negative_offset + @as(i32, @intCast(stored.negative_bucket_counts.len - 1));
-                        const dp_last_number = dp.value.negative_offset + @as(i32, @intCast(dp.value.negative_bucket_counts.len - 1));
-                        const max_number = @max(stored_last_number, dp_last_number);
-                        break :blk @as(usize, @intCast(max_number - new_negative_offset + 1));
-                    } else if (stored.negative_bucket_counts.len != 0)
-                        stored.negative_bucket_counts.len
-                    else if (dp.value.negative_bucket_counts.len != 0)
-                        dp.value.negative_bucket_counts.len
-                    else
-                        0;
-
-                    const new_positive_bucket_counts = try map.allocator.alloc(u64, new_positive_bucket_len);
-                    errdefer map.allocator.free(new_positive_bucket_counts);
-                    @memset(new_positive_bucket_counts, 0);
-                    for (stored.positive_bucket_counts, 0..) |count, i| {
-                        const new_bucket_number = stored.positive_offset + @as(i32, @intCast(i));
-                        const new_index = @as(usize, @intCast(new_bucket_number - new_positive_offset));
-                        new_positive_bucket_counts[new_index] = count;
-                    }
-
-                    for (dp.value.positive_bucket_counts, 0..) |count, i| {
-                        const new_bucket_number = dp.value.positive_offset + @as(i32, @intCast(i));
-                        const new_index = @as(usize, @intCast(new_bucket_number - new_positive_offset));
-                        new_positive_bucket_counts[new_index] = try std.math.add(u64, new_positive_bucket_counts[new_index], count);
-                    }
-
-                    const new_negative_bucket_counts = try map.allocator.alloc(u64, new_negative_bucket_len);
-                    errdefer map.allocator.free(new_negative_bucket_counts);
-                    @memset(new_negative_bucket_counts, 0);
-                    for (stored.negative_bucket_counts, 0..) |count, i| {
-                        const new_bucket_number = stored.negative_offset + @as(i32, @intCast(i));
-                        const new_index = @as(usize, @intCast(new_bucket_number - new_negative_offset));
-                        new_negative_bucket_counts[new_index] = count;
-                    }
-
-                    for (dp.value.negative_bucket_counts, 0..) |count, i| {
-                        const new_bucket_number = dp.value.negative_offset + @as(i32, @intCast(i));
-                        const new_index = @as(usize, @intCast(new_bucket_number - new_negative_offset));
-                        new_negative_bucket_counts[new_index] = try std.math.add(u64, new_negative_bucket_counts[new_index], count);
-                    }
+                    const negative_buckets = try bucketAggregation(
+                        map.allocator,
+                        stored.negative_offset,
+                        stored.negative_bucket_counts,
+                        dp.value.negative_offset,
+                        dp.value.negative_bucket_counts,
+                    );
+                    errdefer map.allocator.free(negative_buckets.bucket_counts);
 
                     map.allocator.free(stored.positive_bucket_counts);
                     map.allocator.free(stored.negative_bucket_counts);
 
                     stored.count = new_count;
                     stored.zero_count = new_zero_count;
-                    stored.positive_offset = new_positive_offset;
-                    stored.negative_offset = new_negative_offset;
-                    stored.positive_bucket_counts = new_positive_bucket_counts;
-                    stored.negative_bucket_counts = new_negative_bucket_counts;
+                    stored.positive_offset = positive_buckets.offset;
+                    stored.negative_offset = negative_buckets.offset;
+                    stored.positive_bucket_counts = positive_buckets.bucket_counts;
+                    stored.negative_bucket_counts = negative_buckets.bucket_counts;
 
                     stored.sum = if (stored.sum != null and dp.value.sum != null)
                         stored.sum.? + dp.value.sum.?
@@ -445,6 +351,87 @@ fn processCumulativeDataPoints(
         dp.value = output_value;
         dp.timestamps = gop.value_ptr.timestamps;
     }
+}
+
+fn bucketScaleConverter(
+    allocator: std.mem.Allocator,
+    offset: i32,
+    bucket_counts: []const u64,
+    scale_delta: i32,
+) !struct { offset: i32, bucket_counts: []u64 } {
+    const new_offset = std.math.shr(i32, offset, scale_delta);
+    const new_bucket_len = if (bucket_counts.len > 0) blk: {
+        const last_stored_bucket_number = offset + @as(i32, @intCast(bucket_counts.len - 1));
+        const new_last_bucket_number = std.math.shr(i32, last_stored_bucket_number, scale_delta);
+        break :blk (new_last_bucket_number - new_offset + 1);
+    } else 0;
+
+    const new_bucket_counts = try allocator.alloc(u64, @as(usize, @intCast(new_bucket_len)));
+    errdefer {
+        allocator.free(new_bucket_counts);
+    }
+    @memset(new_bucket_counts, 0);
+
+    for (bucket_counts, 0..) |count, i| {
+        const bucket_number = offset + @as(i32, @intCast(i));
+        const new_bucket_number = std.math.shr(i32, bucket_number, scale_delta);
+        const new_index = @as(usize, @intCast(new_bucket_number - new_offset));
+        new_bucket_counts[new_index] = try std.math.add(u64, new_bucket_counts[new_index], count);
+    }
+
+    return .{ .offset = new_offset, .bucket_counts = new_bucket_counts };
+}
+
+fn bucketAggregation(
+    allocator: std.mem.Allocator,
+    stored_offset: i32,
+    stored_bucket_counts: []const u64,
+    incoming_offset: i32,
+    incoming_bucket_counts: []const u64,
+) !struct { offset: i32, bucket_counts: []u64 } {
+    const new_offset = if (stored_bucket_counts.len != 0 and incoming_bucket_counts.len != 0)
+        @min(stored_offset, incoming_offset)
+    else if (stored_bucket_counts.len != 0)
+        stored_offset
+    else if (incoming_bucket_counts.len != 0)
+        incoming_offset
+    else
+        0;
+
+    const new_bucket_len = if (stored_bucket_counts.len != 0 and incoming_bucket_counts.len != 0) blk: {
+        const stored_last_number = stored_offset + @as(i32, @intCast(stored_bucket_counts.len - 1));
+        const incoming_last_number = incoming_offset + @as(i32, @intCast(incoming_bucket_counts.len - 1));
+        const max_number = @max(stored_last_number, incoming_last_number);
+        break :blk @as(usize, @intCast(max_number - new_offset + 1));
+    } else if (stored_bucket_counts.len != 0)
+        stored_bucket_counts.len
+    else if (incoming_bucket_counts.len != 0)
+        incoming_bucket_counts.len
+    else
+        0;
+
+    const new_bucket_counts = try allocator.alloc(u64, new_bucket_len);
+    errdefer allocator.free(new_bucket_counts);
+    @memset(new_bucket_counts, 0);
+
+    for ([_]struct { offset: i32, bucket_counts: []const u64 }{
+        .{
+            .offset = stored_offset,
+            .bucket_counts = stored_bucket_counts,
+        },
+        .{
+            .offset = incoming_offset,
+            .bucket_counts = incoming_bucket_counts,
+        },
+    }) |buckets| {
+        for (buckets.bucket_counts, 0..) |count, i| {
+            const new_bucket_number = buckets.offset + @as(i32, @intCast(i));
+            const new_index = @as(usize, @intCast(new_bucket_number - new_offset));
+            new_bucket_counts[new_index] = try std.math.add(u64, new_bucket_counts[new_index], count);
+        }
+    }
+
+    return .{ .offset = new_offset, .bucket_counts = new_bucket_counts };
 }
 
 fn processDeltaDataPoints(
