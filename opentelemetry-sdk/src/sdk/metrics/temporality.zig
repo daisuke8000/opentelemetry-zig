@@ -562,45 +562,77 @@ test "cumulative histogram reuses the output bucket buffer" {
     }
 }
 
-test "cumulative histogram leaves state unchanged on count overflow" {
+test "cumulative histograms leave state unchanged on count overflow" {
     const allocator = std.testing.allocator;
-    const ta = try TemporalAggregator.init(allocator);
-    defer ta.deinit();
-    var first = DataPoint(HistogramDataPoint){
-        .value = .{
-            .count = std.math.maxInt(u64),
-            .sum = 0,
-            .min = 0,
-            .max = 0,
-            .explicit_bounds = &.{},
-            .bucket_counts = try allocator.dupe(u64, &.{std.math.maxInt(u64)}),
-        },
-        .timestamps = .{ .time_ns = 100 },
-    };
-    defer first.deinit(allocator);
-    var measurements = Measurements{
-        .scope = .{ .name = "test" },
-        .instrumentKind = .Histogram,
-        .instrumentOptions = .{ .name = "test-histogram" },
-        .data = .{ .histogram = (&first)[0..1] },
-    };
-    try ta.process(&measurements, view.TemporalityCumulative);
+    inline for (.{ HistogramDataPoint, ExponentialHistogramDataPoint }) |T| {
+        const ta = try TemporalAggregator.init(allocator);
+        defer ta.deinit();
+        var first = DataPoint(T){
+            .value = if (T == HistogramDataPoint) .{
+                .count = std.math.maxInt(u64),
+                .sum = 0,
+                .min = 0,
+                .max = 0,
+                .explicit_bounds = &.{},
+                .bucket_counts = try allocator.dupe(u64, &.{std.math.maxInt(u64)}),
+            } else .{
+                .sum = 0,
+                .count = std.math.maxInt(u64),
+                .zero_count = std.math.maxInt(u64),
+                .min = 0,
+                .max = 0,
+                .scale = 0,
+                .positive_offset = 0,
+                .negative_offset = 0,
+                .positive_bucket_counts = &.{},
+                .negative_bucket_counts = &.{},
+            },
+            .timestamps = .{ .time_ns = 100 },
+        };
+        defer first.deinit(allocator);
+        var measurements = Measurements{
+            .scope = .{ .name = "test" },
+            .instrumentKind = .Histogram,
+            .instrumentOptions = .{ .name = "test-histogram" },
+            .data = if (T == HistogramDataPoint) .{
+                .histogram = (&first)[0..1],
+            } else .{
+                .exponential_histogram = (&first)[0..1],
+            },
+        };
+        try ta.process(&measurements, view.TemporalityCumulative);
 
-    var second = first;
-    second.value = .{
-        .count = 1,
-        .sum = 0.5,
-        .min = 0.5,
-        .max = 0.5,
-        .explicit_bounds = &.{},
-        .bucket_counts = try allocator.dupe(u64, &.{1}),
-    };
-    second.timestamps = .{ .time_ns = 200 };
-    defer second.deinit(allocator);
-    measurements.data = .{ .histogram = (&second)[0..1] };
-    try std.testing.expectError(error.Overflow, ta.process(&measurements, view.TemporalityCumulative));
-    var entries = ta.histograms.valueIterator();
-    try std.testing.expectEqualDeep(first, entries.next().?.*);
+        var second = first;
+        second.value = if (T == HistogramDataPoint) .{
+            .count = 1,
+            .sum = 0.5,
+            .min = 0.5,
+            .max = 0.5,
+            .explicit_bounds = &.{},
+            .bucket_counts = try allocator.dupe(u64, &.{1}),
+        } else .{
+            .count = 1,
+            .sum = 1.5,
+            .min = 1.5,
+            .max = 1.5,
+            .scale = 0,
+            .zero_count = 0,
+            .positive_offset = 0,
+            .negative_offset = 0,
+            .positive_bucket_counts = try allocator.dupe(u64, &.{1}),
+            .negative_bucket_counts = &.{},
+        };
+        second.timestamps = .{ .time_ns = 200 };
+        defer second.deinit(allocator);
+        measurements.data = if (T == HistogramDataPoint) .{
+            .histogram = (&second)[0..1],
+        } else .{
+            .exponential_histogram = (&second)[0..1],
+        };
+        try std.testing.expectError(error.Overflow, ta.process(&measurements, view.TemporalityCumulative));
+        var entries = if (T == HistogramDataPoint) ta.histograms.valueIterator() else ta.exponential_histogram.valueIterator();
+        try std.testing.expectEqualDeep(first, entries.next().?.*);
+    }
 }
 
 test "temporal aggregator process cumulative without timestamps returns error" {
@@ -815,4 +847,136 @@ test "temporal aggregator cumulative gauge keeps a separate last value per attri
     try std.testing.expectEqual(10, m2.data.int[0].value); // /a
     try std.testing.expectEqual(20, m2.data.int[1].value); // /b
     try std.testing.expectEqual(30, m2.data.int[2].value); // /c
+}
+
+test "cumulative exponential histogram merges buckets at different scales" {
+    const allocator = std.testing.allocator;
+
+    for ([_]bool{ false, true }) |reverse_order| {
+        const ta = try TemporalAggregator.init(allocator);
+        defer ta.deinit();
+        var first = DataPoint(ExponentialHistogramDataPoint){
+            .value = .{
+                .count = 21,
+                .sum = null,
+                .scale = 2,
+                .zero_count = 0,
+                .positive_offset = -3,
+                .positive_bucket_counts = try allocator.dupe(u64, &.{ 1, 2, 3, 4, 5 }),
+                .negative_offset = -1,
+                .negative_bucket_counts = try allocator.dupe(u64, &.{ 2, 1, 3 }),
+            },
+            .timestamps = .{ .time_ns = 100 },
+        };
+        defer first.deinit(allocator);
+
+        var second = first;
+        second.value = .{
+            .count = 6,
+            .sum = null,
+            .scale = 0,
+            .zero_count = 0,
+            .positive_offset = -1,
+            .positive_bucket_counts = try allocator.dupe(u64, &.{ 2, 1 }),
+            .negative_offset = -1,
+            .negative_bucket_counts = try allocator.dupe(u64, &.{ 1, 2 }),
+        };
+        second.timestamps = .{ .time_ns = 200 };
+        defer second.deinit(allocator);
+
+        if (reverse_order) {
+            std.mem.swap(ExponentialHistogramDataPoint, &first.value, &second.value);
+        }
+
+        var measurements = Measurements{
+            .scope = .{ .name = "test" },
+            .instrumentKind = .Histogram,
+            .instrumentOptions = .{ .name = "test-exponential-histogram" },
+            .data = .{ .exponential_histogram = (&first)[0..1] },
+        };
+        try ta.process(&measurements, view.TemporalityCumulative);
+
+        measurements.data = .{ .exponential_histogram = (&second)[0..1] };
+        try ta.process(&measurements, view.TemporalityCumulative);
+
+        try std.testing.expectEqual(0, second.value.scale);
+        try std.testing.expectEqual(27, second.value.count);
+        try std.testing.expectEqual(-1, second.value.positive_offset);
+        try std.testing.expectEqual(-1, second.value.negative_offset);
+        try std.testing.expectEqualSlices(u64, &.{ 8, 10 }, second.value.positive_bucket_counts);
+        try std.testing.expectEqualSlices(u64, &.{ 3, 6 }, second.value.negative_bucket_counts);
+    }
+}
+
+test "cumulative exponential histogram cleans up on allocation failure" {
+    inline for (.{ .initial, .stored_finer, .incoming_finer }) |scenario| {
+        var failure_offset: usize = 0;
+        while (true) : (failure_offset += 1) {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            const allocator = failing.allocator();
+            const ta = try TemporalAggregator.init(allocator);
+            defer ta.deinit();
+
+            var first = DataPoint(ExponentialHistogramDataPoint){
+                .value = .{
+                    .count = 21,
+                    .sum = null,
+                    .scale = 2,
+                    .zero_count = 0,
+                    .positive_offset = -3,
+                    .positive_bucket_counts = try allocator.dupe(u64, &.{ 1, 2, 3, 4, 5 }),
+                    .negative_offset = -1,
+                    .negative_bucket_counts = try allocator.dupe(u64, &.{ 2, 1, 3 }),
+                },
+                .timestamps = .{ .time_ns = 100 },
+            };
+            defer first.deinit(allocator);
+
+            var second = first;
+            second.value = .{
+                .count = 6,
+                .sum = null,
+                .scale = 0,
+                .zero_count = 0,
+                .positive_offset = -1,
+                .positive_bucket_counts = try allocator.dupe(u64, &.{ 2, 1 }),
+                .negative_offset = -1,
+                .negative_bucket_counts = try allocator.dupe(u64, &.{ 1, 2 }),
+            };
+            second.timestamps = .{ .time_ns = 200 };
+            defer second.deinit(allocator);
+
+            if (scenario == .incoming_finer) {
+                std.mem.swap(ExponentialHistogramDataPoint, &first.value, &second.value);
+            }
+
+            var measurements = Measurements{
+                .scope = .{ .name = "test" },
+                .instrumentKind = .Histogram,
+                .instrumentOptions = .{ .name = "test-exponential-histogram" },
+                .data = .{ .exponential_histogram = (&first)[0..1] },
+            };
+
+            if (scenario != .initial) {
+                try ta.process(&measurements, view.TemporalityCumulative);
+                measurements.data = .{ .exponential_histogram = (&second)[0..1] };
+            }
+
+            failing.fail_index = failing.alloc_index + failure_offset;
+            failing.resize_fail_index = failing.resize_index;
+            const result = ta.process(&measurements, view.TemporalityCumulative);
+            if (failing.has_induced_failure) {
+                try std.testing.expectError(error.OutOfMemory, result);
+            } else {
+                try result;
+                const value = measurements.data.exponential_histogram[0].value;
+                if (scenario == .initial) {
+                    try std.testing.expectEqual(21, value.count);
+                } else {
+                    try std.testing.expectEqual(27, value.count);
+                }
+                break;
+            }
+        }
+    }
 }
