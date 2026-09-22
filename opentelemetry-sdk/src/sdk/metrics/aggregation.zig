@@ -222,6 +222,7 @@ const ExponentialHistogramState = struct {
 
     positive_buckets: std.AutoArrayHashMapUnmanaged(i32, u64),
     negative_buckets: std.AutoArrayHashMapUnmanaged(i32, u64),
+    const min_scale: i32 = -10;
 
     fn init(allocator: std.mem.Allocator, scale: i32) ExponentialHistogramState {
         _ = allocator;
@@ -250,6 +251,42 @@ const ExponentialHistogramState = struct {
         record_min_max: bool,
         comptime T: type,
     ) !void {
+        // Handle zero values
+        if (value == 0.0) {
+            self.zero_count += 1;
+        } else {
+            // Calculate bucket index using Base2 exponential mapping
+            var bucket_index = getBucketIndex(value, self.scale);
+            const buckets: *std.AutoArrayHashMapUnmanaged(i32, u64) = if (value > 0)
+                &self.positive_buckets
+            else
+                &self.negative_buckets;
+            // Calculate the width of the bucket range, including the new index, without modifying the map
+            var bucket_range_size: i64 = bucketsRangeSizeWithIndex(buckets, bucket_index);
+
+            while (bucket_range_size > max_size) {
+                if (self.scale <= min_scale) return;
+                // Scale down both bucket maps, because they share the same scale
+                var temp_positive_buckets = try downscaleBuckets(allocator, self.positive_buckets);
+                defer temp_positive_buckets.deinit(allocator);
+
+                var temp_negative_buckets = try downscaleBuckets(allocator, self.negative_buckets);
+                defer temp_negative_buckets.deinit(allocator);
+
+                const BucketMap = std.AutoArrayHashMapUnmanaged(i32, u64);
+                // Swap only after both shrink operations succeed
+                // Move the old maps to temporary variables and release them using defer
+                std.mem.swap(BucketMap, &self.positive_buckets, &temp_positive_buckets);
+                std.mem.swap(BucketMap, &self.negative_buckets, &temp_negative_buckets);
+
+                self.scale -= 1;
+                bucket_index = @divFloor(bucket_index, 2);
+                bucket_range_size = bucketsRangeSizeWithIndex(buckets, bucket_index);
+            }
+
+            const result = try buckets.getOrPutValue(allocator, bucket_index, 0);
+            result.value_ptr.* += 1;
+        }
         // Update basic statistics
         self.sum = switch (T) {
             i16, i32, i64 => null, // don't set sum when value can be negative
@@ -262,44 +299,6 @@ const ExponentialHistogramState = struct {
             self.min = if (self.min) |curr| @min(curr, value) else value;
             self.max = if (self.max) |curr| @max(curr, value) else value;
         }
-
-        // Handle zero values
-        if (value == 0.0) {
-            self.zero_count += 1;
-            return;
-        }
-
-        // Calculate bucket index using Base2 exponential mapping
-        var bucket_index = getBucketIndex(value, self.scale);
-        const buckets: *std.AutoArrayHashMapUnmanaged(i32, u64) = if (value > 0)
-            &self.positive_buckets
-        else
-            &self.negative_buckets;
-        // Calculate the width of the bucket range, including the new index, without modifying the map
-        var bucket_range_size: i64 = bucketsRangeSizeWithIndex(buckets, bucket_index);
-
-        // TODO: Decide the minimum scale and what to do when we cannot use max_size
-        while (bucket_range_size > max_size) {
-            // Scale down both bucket maps, because they share the same scale
-            var temp_positive_buckets = try downscaleBuckets(allocator, self.positive_buckets);
-            defer temp_positive_buckets.deinit(allocator);
-
-            var temp_negative_buckets = try downscaleBuckets(allocator, self.negative_buckets);
-            defer temp_negative_buckets.deinit(allocator);
-
-            const BucketMap = std.AutoArrayHashMapUnmanaged(i32, u64);
-            // Swap only after both shrink operations succeed
-            // Move the old maps to temporary variables and release them using defer
-            std.mem.swap(BucketMap, &self.positive_buckets, &temp_positive_buckets);
-            std.mem.swap(BucketMap, &self.negative_buckets, &temp_negative_buckets);
-
-            self.scale -= 1;
-            bucket_index = @divFloor(bucket_index, 2);
-            bucket_range_size = bucketsRangeSizeWithIndex(buckets, bucket_index);
-        }
-
-        const result = try buckets.getOrPutValue(allocator, bucket_index, 0);
-        result.value_ptr.* += 1;
     }
 
     fn toDataPoint(self: *ExponentialHistogramState, allocator: std.mem.Allocator) !ExponentialHistogramDataPoint {
@@ -668,7 +667,7 @@ test "exponential histograms scale down independently per attribute" {
     }
 }
 
-test "Clean up after a memory allocation failure while shrinking the exponential histogram" {
+test "clean up after a memory allocation failure while shrinking the exponential histogram" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const allocator = failing.allocator();
 
@@ -692,4 +691,34 @@ test "Clean up after a memory allocation failure while shrinking the exponential
     try std.testing.expect(state.negative_buckets.count() == 2);
     try std.testing.expect(state.negative_buckets.get(-2) == 1);
     try std.testing.expect(state.negative_buckets.get(-1) == 1);
+}
+
+test "exponential histogram scale does not fall below lower limit" {
+    const allocator = std.testing.allocator;
+
+    var data_points = [_]DataPoint(f64){
+        .{ .value = 0.5, .attributes = null },
+        .{ .value = 0x1p600, .attributes = null },
+        .{ .value = 0x1p-1074, .attributes = null },
+    };
+
+    const result = try aggregateExponentialBucketHistogram(f64, allocator, &data_points, -9, 2, true);
+    defer {
+        for (result) |*dp| {
+            dp.deinit(allocator);
+        }
+        allocator.free(result);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    const exp_hist = result[0].value;
+    try std.testing.expect(exp_hist.scale == -10);
+    try std.testing.expect(exp_hist.positive_offset == -1);
+    try std.testing.expectEqualSlices(
+        u64,
+        &[_]u64{ 1, 1 },
+        exp_hist.positive_bucket_counts,
+    );
+    try std.testing.expect(exp_hist.count == 2);
+    try std.testing.expect(exp_hist.min == 0.5);
 }
