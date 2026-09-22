@@ -699,6 +699,8 @@ test "exponential histogram scale does not fall below lower limit" {
     var data_points = [_]DataPoint(f64){
         .{ .value = 0.5, .attributes = null },
         .{ .value = 0x1p600, .attributes = null },
+        // Create a condition requiring reduction to -11 to fit in max_size = 2 using denormalized numbers.
+        // Stop reduction at the lower limit (-10) and ensure this value is excluded from aggregation.
         .{ .value = 0x1p-1074, .attributes = null },
     };
 
