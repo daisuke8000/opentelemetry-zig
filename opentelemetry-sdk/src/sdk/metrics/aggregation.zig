@@ -261,16 +261,25 @@ const ExponentialHistogramState = struct {
                 &self.positive_buckets
             else
                 &self.negative_buckets;
-            // Calculate the width of the bucket range, including the new index, without modifying the map
-            var bucket_range_size: i64 = bucketsRangeSizeWithIndex(buckets, bucket_index);
 
-            while (bucket_range_size > max_size) {
-                if (self.scale <= min_scale) return;
+            var range = bucketIndexRangeWithNewIndex(buckets, bucket_index);
+            var downscale_steps: i32 = 0;
+
+            while (range.width() > max_size) {
+                if (self.scale - downscale_steps <= min_scale) return;
+                range.min = @divFloor(range.min, 2);
+                range.max = @divFloor(range.max, 2);
+                bucket_index = @divFloor(bucket_index, 2);
+                downscale_steps += 1;
+            }
+
+            if (downscale_steps != 0) {
+                const index_divisor = std.math.pow(i64, 2, downscale_steps);
                 // Scale down both bucket maps, because they share the same scale
-                var temp_positive_buckets = try downscaleBuckets(allocator, self.positive_buckets);
+                var temp_positive_buckets = try downscaleBuckets(allocator, self.positive_buckets, index_divisor);
                 defer temp_positive_buckets.deinit(allocator);
 
-                var temp_negative_buckets = try downscaleBuckets(allocator, self.negative_buckets);
+                var temp_negative_buckets = try downscaleBuckets(allocator, self.negative_buckets, index_divisor);
                 defer temp_negative_buckets.deinit(allocator);
 
                 const BucketMap = std.AutoArrayHashMapUnmanaged(i32, u64);
@@ -278,10 +287,7 @@ const ExponentialHistogramState = struct {
                 // Move the old maps to temporary variables and release them using defer
                 std.mem.swap(BucketMap, &self.positive_buckets, &temp_positive_buckets);
                 std.mem.swap(BucketMap, &self.negative_buckets, &temp_negative_buckets);
-
-                self.scale -= 1;
-                bucket_index = @divFloor(bucket_index, 2);
-                bucket_range_size = bucketsRangeSizeWithIndex(buckets, bucket_index);
+                self.scale -= downscale_steps;
             }
 
             const result = try buckets.getOrPutValue(allocator, bucket_index, 0);
@@ -321,22 +327,32 @@ const ExponentialHistogramState = struct {
     }
 };
 
-fn bucketsRangeSizeWithIndex(
+const BucketIndexRange = struct {
+    min: i32,
+    max: i32,
+
+    fn width(self: @This()) i64 {
+        return @as(i64, self.max) - @as(i64, self.min) + 1;
+    }
+};
+
+fn bucketIndexRangeWithNewIndex(
     buckets: *const std.AutoArrayHashMapUnmanaged(i32, u64),
     new_index: i32,
-) i64 {
+) BucketIndexRange {
     const keys = buckets.keys();
-    if (keys.len == 0) return 1;
+    if (keys.len == 0) return .{ .min = new_index, .max = new_index };
 
     var min_idx, var max_idx = std.mem.minMax(i32, keys);
     min_idx = @min(new_index, min_idx);
     max_idx = @max(new_index, max_idx);
-    return @as(i64, max_idx) - @as(i64, min_idx) + 1;
+    return .{ .min = min_idx, .max = max_idx };
 }
 
 fn downscaleBuckets(
     allocator: std.mem.Allocator,
     buckets: std.AutoArrayHashMapUnmanaged(i32, u64),
+    index_divisor: i64,
 ) !std.AutoArrayHashMapUnmanaged(i32, u64) {
     var temp_buckets: std.AutoArrayHashMapUnmanaged(i32, u64) = .empty;
     errdefer temp_buckets.deinit(allocator);
@@ -345,7 +361,7 @@ fn downscaleBuckets(
         buckets.keys(),
         buckets.values(),
     ) |idx, count| {
-        const new_idx = @divFloor(idx, 2);
+        const new_idx: i32 = @intCast(@divFloor(idx, index_divisor));
         const result = try temp_buckets.getOrPutValue(allocator, new_idx, 0);
         result.value_ptr.* += count;
     }
