@@ -749,7 +749,10 @@ test "metric reader cumulative histogram separates instrument options" {
 }
 
 fn exponentialAggregationScaleZero(_: Kind) view.Aggregation {
-    return .{ .ExponentialBucketHistogram = .{ .max_scale = 0 } };
+    // Default (1024) is guaranteed to be valid.
+    return .{ .ExponentialBucketHistogram = view.ExponentialBucketHistogramConfig.init(.{
+        .max_scale = 0,
+    }) catch unreachable };
 }
 
 test "metric reader cumulative exponential histogram across collection" {
