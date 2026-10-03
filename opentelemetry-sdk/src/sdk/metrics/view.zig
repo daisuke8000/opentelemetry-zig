@@ -196,6 +196,14 @@ pub const Aggregation = union(enum) {
             .ExponentialBucketHistogram => .ExponentialBucketHistogram,
         };
     }
+
+    pub fn validate(self: Aggregation) !void {
+        switch (self) {
+            .Drop, .Sum, .LastValue => {},
+            .ExplicitBucketHistogram => {},
+            .ExponentialBucketHistogram => |config| try config.validate(),
+        }
+    }
 };
 
 /// Simple enum for aggregation type matching
